@@ -91,6 +91,10 @@ def run():
     print(f"Total training blocks: {len(train_dataset)}")
     print(f"Total validation blocks: {len(val_dataset)}")
 
+    #########################
+    #   MODEL INSTANCES
+    #########################
+
     device = torch.device("cuda")
 
     from lejepa import LeJEPAEncoder
@@ -110,6 +114,11 @@ def run():
         d_hidden=512, 
         num_layers=4
     ).to(device)
+
+    from lejepa import SIGReg
+    sigreg = SIGReg().to(device)
+
+    
 
     return
 

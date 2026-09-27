@@ -1,2 +1,19 @@
+# Data binaries
 wiki_train.bin
 wiki_val.bin
+
+# Python byte-compiled files & caches
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+.ipynb_checkpoints/
+
+# Model checkpoints & logs
+checkpoints/
+checkpoints*/
+*.pt
+*.pth
+*.ckpt
+wandb/
