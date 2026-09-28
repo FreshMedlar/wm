@@ -10,29 +10,32 @@ from firstPAgent.losses import compute_latent_metrics, sigreg_loss
 
 class TestLosses(unittest.TestCase):
 
-    def test_sigreg_identity_covariance(self):
-        """When representations have variance 1 and zero correlation, SIGReg loss should be minimal."""
+    def test_sigreg_standard_normal(self):
+        """When representations are drawn from N(0, I), SIGReg Epps-Pulley statistic should be minimal."""
         torch.manual_seed(42)
-        B, D = 1000, 32
+        B, D = 500, 32
         z = torch.randn(B, D)
-        loss = sigreg_loss(z, alpha=1.0, beta=0.05)
-        self.assertLess(loss.item(), 0.15)
+        loss = sigreg_loss(z, knots=17, num_proj=512)
+        # For standard normal, the statistic approaches 0 (subject to finite sample error)
+        self.assertLess(loss.item(), 5.0)
 
-    def test_sigreg_collapsed_variance(self):
-        """When representations collapse (zero variance), loss_std must be ~1.0."""
+    def test_sigreg_collapsed_distribution(self):
+        """When representations collapse to a constant, SIGReg statistic should be significantly higher."""
+        torch.manual_seed(42)
         B, D = 128, 32
-        z = torch.ones(B, D) * 5.0
-        loss = sigreg_loss(z, alpha=1.0, beta=0.0)
-        self.assertAlmostEqual(loss.item(), 1.0, delta=0.05)
+        z_normal = torch.randn(B, D)
+        z_collapsed = torch.zeros(B, D)
+        loss_normal = sigreg_loss(z_normal, knots=17, num_proj=512)
+        loss_collapsed = sigreg_loss(z_collapsed, knots=17, num_proj=512)
+        self.assertGreater(loss_collapsed.item(), loss_normal.item() * 2)
 
-    def test_sigreg_correlated_dimensions(self):
-        """When dimensions are perfectly correlated, loss_cov must be positive and penalize redundancy."""
-        B, D = 128, 16
-        v = torch.randn(B, 1)
-        z = v.repeat(1, D)  # All D dimensions are identical
-        loss_uncorrelated = sigreg_loss(torch.randn(B, D), alpha=0.0, beta=1.0)
-        loss_correlated = sigreg_loss(z, alpha=0.0, beta=1.0)
-        self.assertGreater(loss_correlated.item(), loss_uncorrelated.item())
+    def test_sigreg_gradient_flow(self):
+        """Verify gradients flow from SIGReg back to latent representations."""
+        z = torch.randn(64, 32, requires_grad=True)
+        loss = sigreg_loss(z, knots=17, num_proj=256)
+        loss.backward()
+        self.assertIsNotNone(z.grad)
+        self.assertTrue(torch.any(z.grad != 0.0))
 
     def test_compute_latent_metrics(self):
         """Verify diagnostic metrics computation."""

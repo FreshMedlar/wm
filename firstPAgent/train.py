@@ -105,10 +105,10 @@ def parse_args():
     parser.add_argument("--lr", type=float, default=3e-4, help="Learning rate")
     parser.add_argument("--weight_decay", type=float, default=1e-5, help="Weight decay")
     parser.add_argument(
-        "--alpha", type=float, default=1.0, help="SIGReg loss_std weight"
+        "--sigreg_knots", type=int, default=17, help="True SIGReg quadrature knots (default: 17)"
     )
     parser.add_argument(
-        "--beta", type=float, default=0.05, help="SIGReg loss_cov weight"
+        "--sigreg_num_proj", type=int, default=1024, help="True SIGReg random 1D projections (default: 1024)"
     )
     parser.add_argument(
         "--gamma", type=float, default=1.0, help="Total loss regularizer weight"
@@ -227,8 +227,8 @@ def main():
         latent_dim=args.latent_dim,
         act_dim=act_dim,
         num_models=args.ensemble_size,
-        alpha=args.alpha,
-        beta=args.beta,
+        sigreg_knots=args.sigreg_knots,
+        sigreg_num_proj=args.sigreg_num_proj,
         gamma=args.gamma,
         lr=args.lr,
         weight_decay=args.weight_decay,

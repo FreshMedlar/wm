@@ -5,7 +5,7 @@ First-Principles Active Inference Agent with Single Shared Encoder and Target De
 from firstPAgent.agent import FirstPrinciplesActiveInferenceAgent
 from firstPAgent.buffer import PixelReplayBuffer
 from firstPAgent.env import GymPixelWrapper, make_pixel_env
-from firstPAgent.losses import compute_latent_metrics, sigreg_loss
+from firstPAgent.losses import SIGReg, compute_latent_metrics, sigreg_loss
 from firstPAgent.networks import (
     PixelEncoder,
     PredictorEnsemble,
@@ -20,6 +20,7 @@ __all__ = [
     "PixelReplayBuffer",
     "GymPixelWrapper",
     "make_pixel_env",
+    "SIGReg",
     "sigreg_loss",
     "compute_latent_metrics",
     "PixelEncoder",

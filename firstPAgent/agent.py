@@ -38,8 +38,8 @@ class FirstPrinciplesActiveInferenceAgent:
         act_dim: int = 2,
         num_models: int = 5,
         hidden_dim: int = 256,
-        alpha: float = 1.0,
-        beta: float = 0.05,
+        sigreg_knots: int = 17,
+        sigreg_num_proj: int = 1024,
         gamma: float = 1.0,
         lr: float = 3e-4,
         weight_decay: float = 1e-5,
@@ -60,10 +60,12 @@ class FirstPrinciplesActiveInferenceAgent:
         self.device = torch.device(device)
         self.latent_dim = latent_dim
         self.act_dim = act_dim
-        self.alpha = alpha
-        self.beta = beta
         self.gamma = gamma
         self.w_rew = w_rew
+
+        # 0. Sketch Isotropic Gaussian Regularizer (True SIGReg)
+        from firstPAgent.losses import SIGReg
+        self.sigreg = SIGReg(knots=sigreg_knots, num_proj=sigreg_num_proj).to(self.device)
 
         # 1. Single Perceptual Encoder E_θ
         self.encoder = PixelEncoder(
@@ -185,8 +187,8 @@ class FirstPrinciplesActiveInferenceAgent:
             pred_losses.append(F.mse_loss(z_next_pred, z_next_target))
         loss_dyn = torch.stack(pred_losses).mean()
 
-        # 4. Anti-collapse regularizer (SIGReg)
-        loss_reg = sigreg_loss(z_t, alpha=self.alpha, beta=self.beta)
+        # 4. Anti-collapse regularizer (True SIGReg)
+        loss_reg = self.sigreg(z_t)
 
         # 5. Combined World Model backprop
         loss_wm = loss_dyn + gamma * loss_reg
