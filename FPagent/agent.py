@@ -36,6 +36,7 @@ class FirstPrinciplesActiveInferenceAgent:
         in_channels: int = 3,
         latent_dim: int = 64,
         act_dim: int = 2,
+        context_dim: int = 0,
         num_models: int = 5,
         hidden_dim: int = 256,
         sigreg_knots: int = 17,
@@ -60,6 +61,7 @@ class FirstPrinciplesActiveInferenceAgent:
         self.device = torch.device(device)
         self.latent_dim = latent_dim
         self.act_dim = act_dim
+        self.context_dim = context_dim
         self.gamma = gamma
         self.w_rew = w_rew
 
@@ -78,6 +80,7 @@ class FirstPrinciplesActiveInferenceAgent:
             num_models=num_models,
             latent_dim=latent_dim,
             act_dim=act_dim,
+            context_dim=context_dim,
             hidden_dim=hidden_dim,
             residual=True,
         ).to(self.device)
@@ -85,6 +88,7 @@ class FirstPrinciplesActiveInferenceAgent:
         # 3. Viability Network V_ψ
         self.viability_net = ViabilityClassifier(
             latent_dim=latent_dim,
+            context_dim=context_dim,
             hidden_dim=hidden_dim // 2,
         ).to(self.device)
 
@@ -92,6 +96,7 @@ class FirstPrinciplesActiveInferenceAgent:
         self.reward_net = RewardPredictor(
             latent_dim=latent_dim,
             act_dim=act_dim,
+            context_dim=context_dim,
             hidden_dim=hidden_dim // 2,
         ).to(self.device)
 
@@ -161,7 +166,12 @@ class FirstPrinciplesActiveInferenceAgent:
         if gamma is None:
             gamma = self.gamma
 
-        if len(batch) == 5:
+        context = None
+        if len(batch) == 6:
+            obs_t, actions, rewards, obs_next, dones, context = batch
+            rewards = rewards.to(self.device)
+            context = context.to(self.device)
+        elif len(batch) == 5:
             obs_t, actions, rewards, obs_next, dones = batch
             rewards = rewards.to(self.device)
         else:
@@ -183,7 +193,7 @@ class FirstPrinciplesActiveInferenceAgent:
         # 3. Predictor dynamics loss
         pred_losses = []
         for predictor in self.predictor_ensemble:
-            z_next_pred = predictor(z_t, actions)
+            z_next_pred = predictor(z_t, actions, context=context)
             pred_losses.append(F.mse_loss(z_next_pred, z_next_target))
         loss_dyn = torch.stack(pred_losses).mean()
 
@@ -197,7 +207,7 @@ class FirstPrinciplesActiveInferenceAgent:
         self.opt_world_model.step()
 
         # 6. Viability classifier update (independent loss, detached latents)
-        v_pred = self.viability_net(z_t.detach())
+        v_pred = self.viability_net(z_t.detach(), context=context)
         loss_viab = F.binary_cross_entropy(v_pred, dones)
         self.opt_viability.zero_grad(set_to_none=True)
         loss_viab.backward()
@@ -205,7 +215,7 @@ class FirstPrinciplesActiveInferenceAgent:
 
         # 7. Extrinsic Reward Predictor update (Huber/Smooth L1 loss on detached latents)
         # Smooth L1 prevents gradient shocks from sparse, high-magnitude terminal rewards (e.g. -100 crash)
-        r_pred = self.reward_net(z_t.detach(), actions)
+        r_pred = self.reward_net(z_t.detach(), actions, context=context)
         loss_rew = F.smooth_l1_loss(r_pred, rewards.view(-1))
         self.opt_reward.zero_grad(set_to_none=True)
         loss_rew.backward()
@@ -217,7 +227,7 @@ class FirstPrinciplesActiveInferenceAgent:
         with torch.no_grad():
             # Epistemic uncertainty on the training batch
             _, batch_epi_unc, _ = self.predictor_ensemble.predict_with_uncertainty(
-                z_t.detach(), actions
+                z_t.detach(), actions, context=context
             )
             mean_epi_unc = batch_epi_unc.mean().item()
 
@@ -242,6 +252,7 @@ class FirstPrinciplesActiveInferenceAgent:
     def select_action(
         self,
         obs: Union[torch.Tensor, np.ndarray],
+        context: Optional[torch.Tensor] = None,
         warm_start: bool = True,
     ) -> Tuple[np.ndarray, Dict[str, float]]:
         """
@@ -249,6 +260,7 @@ class FirstPrinciplesActiveInferenceAgent:
 
         Args:
             obs: Observation frame (C, H, W) or (1, C, H, W)
+            context: Optional language context vector (1, context_dim) or (context_dim,)
             warm_start: Shift previous trajectory solution
 
         Returns:
@@ -264,8 +276,10 @@ class FirstPrinciplesActiveInferenceAgent:
         # Encode current pixel frame
         z_t = self.encoder(obs)
 
-        # Plan action sequence
-        action, plan_diagnostics = self.planner.plan(z_t, warm_start=warm_start)
+        # Plan action sequence conditioned on optional language context
+        action, plan_diagnostics = self.planner.plan(
+            z_t, context=context, warm_start=warm_start
+        )
         return action, plan_diagnostics
 
     def reset_planner(self):

@@ -21,11 +21,13 @@ class PixelReplayBuffer:
         capacity: int = 100000,
         obs_shape: Tuple[int, int, int] = (3, 64, 64),
         act_dim: int = 2,
+        context_dim: int = 0,
         device: Union[str, torch.device] = "cpu",
     ):
         self.capacity = capacity
         self.obs_shape = obs_shape
         self.act_dim = act_dim
+        self.context_dim = context_dim
         self.device = torch.device(device)
 
         self.idx = 0
@@ -37,6 +39,10 @@ class PixelReplayBuffer:
         self.action_buffer = np.zeros((capacity, act_dim), dtype=np.float32)
         self.reward_buffer = np.zeros((capacity, 1), dtype=np.float32)
         self.done_buffer = np.zeros((capacity, 1), dtype=np.float32)
+        if context_dim > 0:
+            self.context_buffer = np.zeros((capacity, context_dim), dtype=np.float32)
+        else:
+            self.context_buffer = None
 
     def _to_uint8(self, obs: Union[np.ndarray, torch.Tensor]) -> np.ndarray:
         """Convert observation to uint8 array."""
@@ -57,13 +63,10 @@ class PixelReplayBuffer:
         arg3: Union[float, int, np.ndarray, torch.Tensor],
         arg4: Union[np.ndarray, torch.Tensor, bool, float, int] = None,
         arg5: Optional[Union[bool, float, int]] = None,
+        context: Optional[Union[np.ndarray, torch.Tensor]] = None,
     ):
         """
         Add a transition tuple to the FIFO buffer.
-
-        Supports both:
-          add(obs, action, reward, next_obs, done)  [5 arguments]
-          add(obs, action, next_obs, done)          [4 arguments, reward defaults to 0.0]
         """
         if arg5 is not None:
             # 5-argument signature: (obs, action, reward, next_obs, done)
@@ -91,21 +94,22 @@ class PixelReplayBuffer:
         self.next_obs_buffer[self.idx] = next_obs_u8
         self.done_buffer[self.idx] = 1.0 if done else 0.0
 
+        if self.context_buffer is not None and context is not None:
+            if isinstance(context, torch.Tensor):
+                context = context.detach().cpu().numpy()
+            self.context_buffer[self.idx] = np.asarray(context, dtype=np.float32).reshape(-1)
+
         self.idx = (self.idx + 1) % self.capacity
         self.size = min(self.size + 1, self.capacity)
 
     def sample(
         self, batch_size: int, device: Union[str, torch.device, None] = None
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Union[
+        Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+        Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+    ]:
         """
         Sample a random mini-batch of transitions.
-
-        Returns:
-            obs_t: FloatTensor (B, C, H, W) normalized to [0.0, 1.0]
-            actions: FloatTensor (B, act_dim)
-            rewards: FloatTensor (B, 1)
-            obs_next: FloatTensor (B, C, H, W) normalized to [0.0, 1.0]
-            dones: FloatTensor (B, 1) in {0.0, 1.0}
         """
         if self.size < batch_size:
             raise ValueError(
@@ -125,6 +129,10 @@ class PixelReplayBuffer:
             torch.from_numpy(self.next_obs_buffer[indices]).to(target_device).float() / 255.0
         )
         dones = torch.from_numpy(self.done_buffer[indices]).to(target_device).float()
+
+        if self.context_buffer is not None:
+            context = torch.from_numpy(self.context_buffer[indices]).to(target_device).float()
+            return obs_t, actions, rewards, obs_next, dones, context
 
         return obs_t, actions, rewards, obs_next, dones
 

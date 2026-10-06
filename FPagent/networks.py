@@ -79,22 +79,25 @@ class PixelEncoder(nn.Module):
 
 class TransitionPredictor(nn.Module):
     """
-    Transition model P_ϕm(z_t, a_t) predicting the next latent state ẑ_{t+1}.
+    Transition model P_ϕm(z_t, a_t, [c_t]) predicting the next latent state ẑ_{t+1}.
+    Optionally conditioned on language context c_t.
     """
 
     def __init__(
         self,
         latent_dim: int = 64,
         act_dim: int = 2,
+        context_dim: int = 0,
         hidden_dim: int = 256,
         residual: bool = True,
     ):
         super().__init__()
         self.latent_dim = latent_dim
         self.act_dim = act_dim
+        self.context_dim = context_dim
         self.residual = residual
 
-        in_dim = latent_dim + act_dim
+        in_dim = latent_dim + act_dim + context_dim
         self.net = nn.Sequential(
             nn.Linear(in_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
@@ -105,13 +108,31 @@ class TransitionPredictor(nn.Module):
             nn.Linear(hidden_dim, latent_dim),
         )
 
-    def forward(self, z: torch.Tensor, a: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        z: torch.Tensor,
+        a: torch.Tensor,
+        context: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """
         z: (..., D)
         a: (..., A)
+        context: optional (..., C) context vector
         returns: (..., D)
         """
-        x = torch.cat([z, a], dim=-1)
+        inputs = [z, a]
+        if self.context_dim > 0 and context is not None:
+            # Broadcast context to match leading dimensions of z
+            if context.shape[:-1] != z.shape[:-1]:
+                target_shape = list(z.shape[:-1]) + [self.context_dim]
+                context = context.reshape(-1, self.context_dim)
+                if context.size(0) == 1:
+                    context = context.expand(*target_shape)
+                else:
+                    context = context.expand(*target_shape)
+            inputs.append(context)
+
+        x = torch.cat(inputs, dim=-1)
         delta = self.net(x)
         if self.residual:
             return z + delta
@@ -122,6 +143,7 @@ class PredictorEnsemble(nn.Module):
     """
     Causal Ensemble World Model {P_ϕ1, ..., P_ϕM}.
     Provides independent transition models and epistemic uncertainty quantification.
+    Supports optional language context conditioning.
     """
 
     def __init__(
@@ -129,6 +151,7 @@ class PredictorEnsemble(nn.Module):
         num_models: int = 5,
         latent_dim: int = 64,
         act_dim: int = 2,
+        context_dim: int = 0,
         hidden_dim: int = 256,
         residual: bool = True,
     ):
@@ -136,11 +159,13 @@ class PredictorEnsemble(nn.Module):
         self.num_models = num_models
         self.latent_dim = latent_dim
         self.act_dim = act_dim
+        self.context_dim = context_dim
 
         self.predictors = nn.ModuleList([
             TransitionPredictor(
                 latent_dim=latent_dim,
                 act_dim=act_dim,
+                context_dim=context_dim,
                 hidden_dim=hidden_dim,
                 residual=residual,
             )
@@ -156,61 +181,62 @@ class PredictorEnsemble(nn.Module):
     def __getitem__(self, idx: int) -> TransitionPredictor:
         return self.predictors[idx]
 
-    def forward(self, z: torch.Tensor, a: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        z: torch.Tensor,
+        a: torch.Tensor,
+        context: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """
-        Evaluate all M models on input (z, a).
-        z: (B, D) or (N, D)
-        a: (B, A) or (N, A)
-        returns: (M, B, D)
+        Evaluate all M models on input (z, a, [context]).
+        returns: (M, ..., D)
         """
-        preds = [predictor(z, a) for predictor in self.predictors]
+        preds = [predictor(z, a, context=context) for predictor in self.predictors]
         return torch.stack(preds, dim=0)
 
     def predict_with_uncertainty(
-        self, z: torch.Tensor, a: torch.Tensor
+        self,
+        z: torch.Tensor,
+        a: torch.Tensor,
+        context: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Computes the ensemble mean prediction and epistemic uncertainty.
 
-        Epistemic Uncertainty Formulation:
-          z̄_{t+1} = 1/M * sum_{m=1}^M P_ϕm(z_t, a_t)
-          U(z_t, a_t) = 1/M * sum_{m=1}^M || P_ϕm(z_t, a_t) - z̄_{t+1} ||_2^2
-
-        Args:
-            z: (N, D)
-            a: (N, A)
-
         Returns:
-            mean_pred: (N, D) ensemble mean next state
-            uncertainty: (N,) epistemic variance across models
-            all_preds: (M, N, D) raw predictions from all M models
+            mean_pred: (..., D) ensemble mean next state
+            uncertainty: (...) epistemic variance across models
+            all_preds: (M, ..., D) raw predictions from all M models
         """
-        all_preds = self.forward(z, a)  # (M, N, D)
-        mean_pred = all_preds.mean(dim=0)  # (N, D)
+        all_preds = self.forward(z, a, context=context)
+        mean_pred = all_preds.mean(dim=0)
 
-        # Epistemic uncertainty: variance of predictions across ensemble members
-        # Sum of squared deviations across latent dimensions D
-        diff = all_preds - mean_pred.unsqueeze(0)  # (M, N, D)
-        sq_err = diff.pow(2).sum(dim=-1)  # (M, N)
-        uncertainty = sq_err.mean(dim=0)  # (N,)
+        diff = all_preds - mean_pred.unsqueeze(0)
+        sq_err = diff.pow(2).sum(dim=-1)
+        uncertainty = sq_err.mean(dim=0)
 
         return mean_pred, uncertainty, all_preds
 
 
 class ViabilityClassifier(nn.Module):
     """
-    Viability Classifier V_ψ(z) mapping latent state to probability of terminal failure [0, 1].
-    Trained on empirical environment termination flags (dones) via BCE.
+    Viability Classifier V_ψ(z, [context]) mapping latent state to probability of failure [0, 1].
+    Trained on empirical termination flags via BCE.
     """
 
     def __init__(
         self,
         latent_dim: int = 64,
+        context_dim: int = 0,
         hidden_dim: int = 128,
     ):
         super().__init__()
+        self.latent_dim = latent_dim
+        self.context_dim = context_dim
+
+        in_dim = latent_dim + context_dim
         self.net = nn.Sequential(
-            nn.Linear(latent_dim, hidden_dim),
+            nn.Linear(in_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.SiLU(),
             nn.Linear(hidden_dim, hidden_dim),
@@ -220,35 +246,28 @@ class ViabilityClassifier(nn.Module):
             nn.Sigmoid(),
         )
 
-    def forward(self, z: torch.Tensor) -> torch.Tensor:
-        """
-        z: (..., D)
-        returns: (..., 1) in range [0, 1]
-        """
-        return self.net(z)
+    def forward(
+        self,
+        z: torch.Tensor,
+        context: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        inputs = [z]
+        if self.context_dim > 0 and context is not None:
+            if context.shape[:-1] != z.shape[:-1]:
+                target_shape = list(z.shape[:-1]) + [self.context_dim]
+                context = context.reshape(-1, self.context_dim).expand(*target_shape)
+            inputs.append(context)
+        x = torch.cat(inputs, dim=-1)
+        return self.net(x)
 
     def compute_viability_cost(
         self,
         z: torch.Tensor,
+        context: Optional[torch.Tensor] = None,
         mode: str = "log",
         eps: float = 1e-4,
     ) -> torch.Tensor:
-        """
-        Computes the viability cost G_viab for planning.
-
-        Modes:
-          'log': G_viab = -log(1 - V_ψ(z) + eps)
-          'linear': G_viab = V_ψ(z)
-
-        Args:
-            z: (N, D)
-            mode: 'log' or 'linear'
-            eps: Epsilon for numerical stability in log
-
-        Returns:
-            Cost tensor of shape (N,)
-        """
-        prob = self.forward(z).squeeze(-1)  # (N,)
+        prob = self.forward(z, context=context).squeeze(-1)
         if mode == "log":
             return -torch.log(torch.clamp(1.0 - prob, min=eps))
         elif mode == "linear":
@@ -259,21 +278,22 @@ class ViabilityClassifier(nn.Module):
 
 class RewardPredictor(nn.Module):
     """
-    Reward Predictor R_ω(z_t, a_t) mapping latent state and action to expected scalar reward.
-    Enables pragmatic value maximization in Active Inference / Model Predictive Control.
+    Reward Predictor R_ω(z_t, a_t, [context]) mapping latent state and action to expected reward.
     """
 
     def __init__(
         self,
         latent_dim: int = 64,
         act_dim: int = 2,
+        context_dim: int = 0,
         hidden_dim: int = 128,
     ):
         super().__init__()
         self.latent_dim = latent_dim
         self.act_dim = act_dim
+        self.context_dim = context_dim
 
-        in_dim = latent_dim + act_dim
+        in_dim = latent_dim + act_dim + context_dim
         self.net = nn.Sequential(
             nn.Linear(in_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
@@ -284,12 +304,18 @@ class RewardPredictor(nn.Module):
             nn.Linear(hidden_dim, 1),
         )
 
-    def forward(self, z: torch.Tensor, a: torch.Tensor) -> torch.Tensor:
-        """
-        z: (..., D)
-        a: (..., A)
-        returns: (...,) scalar reward prediction
-        """
-        x = torch.cat([z, a], dim=-1)
+    def forward(
+        self,
+        z: torch.Tensor,
+        a: torch.Tensor,
+        context: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        inputs = [z, a]
+        if self.context_dim > 0 and context is not None:
+            if context.shape[:-1] != z.shape[:-1]:
+                target_shape = list(z.shape[:-1]) + [self.context_dim]
+                context = context.reshape(-1, self.context_dim).expand(*target_shape)
+            inputs.append(context)
+        x = torch.cat(inputs, dim=-1)
         return self.net(x).squeeze(-1)
 

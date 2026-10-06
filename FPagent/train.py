@@ -17,6 +17,13 @@ from typing import Optional
 # Ensure project root is in sys.path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+# IMPORTANT: miniworld / pyglet must be imported before PyTorch / CUDA
+# to prevent AMD/Nvidia GPU driver shared library conflicts with X11 GLX.
+try:
+    import miniworld
+except ImportError:
+    pass
+
 import gymnasium as gym
 import numpy as np
 import torch
@@ -174,6 +181,12 @@ def parse_args():
         help="Directory to save checkpoints",
     )
     parser.add_argument(
+        "--resume_checkpoint",
+        type=str,
+        default=None,
+        help="Path to saved model checkpoint to resume training from",
+    )
+    parser.add_argument(
         "--log_interval",
         type=int,
         default=100,
@@ -199,12 +212,28 @@ def main():
     # Phase 0: Initialization
     # -------------------------------------------------------------
     print("\n[Phase 0: Initialization]")
-    env = make_pixel_env(
-        env_id=args.env_id,
-        continuous=args.continuous,
-        img_size=(args.img_size, args.img_size),
-        seed=args.seed,
-    )
+    use_language = "miniworld" in args.env_id.lower()
+
+    if use_language:
+        from firstPAgent.miniworld_env import MiniWorldLanguageWrapper
+        from firstPAgent.language import LanguageContextEncoder
+        env = MiniWorldLanguageWrapper(
+            env_id=args.env_id,
+            img_size=(args.img_size, args.img_size),
+            max_episode_steps=args.max_steps_per_episode,
+        )
+        context_dim = 64
+        lang_encoder = LanguageContextEncoder(context_dim=context_dim, device=args.device)
+        print(f"Language conditioning enabled using pretrained MiniLM (context_dim={context_dim})")
+    else:
+        env = make_pixel_env(
+            env_id=args.env_id,
+            continuous=args.continuous,
+            img_size=(args.img_size, args.img_size),
+            seed=args.seed,
+        )
+        context_dim = 0
+        lang_encoder = None
 
     obs_shape = env.observation_space.shape  # (C, H, W)
     act_dim = env.action_space.shape[0]
@@ -218,6 +247,7 @@ def main():
         capacity=args.buffer_capacity,
         obs_shape=obs_shape,
         act_dim=act_dim,
+        context_dim=context_dim,
         device=args.device,
     )
 
@@ -226,6 +256,7 @@ def main():
         in_channels=obs_shape[0],
         latent_dim=args.latent_dim,
         act_dim=act_dim,
+        context_dim=context_dim,
         num_models=args.ensemble_size,
         sigreg_knots=args.sigreg_knots,
         sigreg_num_proj=args.sigreg_num_proj,
@@ -248,69 +279,81 @@ def main():
 
     os.makedirs(args.save_dir, exist_ok=True)
 
+    if args.resume_checkpoint is not None:
+        print(f"\n--> Resuming weights from checkpoint: {args.resume_checkpoint}")
+        agent.load(args.resume_checkpoint)
+
     # -------------------------------------------------------------
     # Phase 1: Dynamics Warm-up (Random Exploration)
     # -------------------------------------------------------------
-    print(f"\n[Phase 1: Dynamics Warm-up - Collecting {args.warmup_steps} random steps]")
-    obs, _ = env.reset(seed=args.seed)
-    pbar_collect = tqdm(total=args.warmup_steps, desc="Exploring (Random Policy)")
+    # If resuming from an already trained world model and warmup_steps==0, skip warm-up
+    skip_warmup = (args.resume_checkpoint is not None and args.warmup_steps == 0)
+    if skip_warmup:
+        print("\n[Phase 1: Skipped because --resume_checkpoint is provided with --warmup_steps 0]")
+    else:
+        print(f"\n[Phase 1: Dynamics Warm-up - Collecting {args.warmup_steps} random steps]")
+    if not skip_warmup:
+        obs, info = env.reset(seed=args.seed)
+        context_emb = lang_encoder(info["instruction"]) if (lang_encoder and "instruction" in info) else None
 
-    collected_steps = 0
-    while collected_steps < args.warmup_steps:
-        action = env.action_space.sample()
-        next_obs, reward, terminated, truncated, _ = env.step(action)
-        done = terminated or truncated
+        pbar_collect = tqdm(total=args.warmup_steps, desc="Exploring (Random Policy)")
 
-        buffer.add(obs, action, reward, next_obs, done)
-        collected_steps += 1
-        pbar_collect.update(1)
+        collected_steps = 0
+        while collected_steps < args.warmup_steps:
+            action = env.action_space.sample()
+            next_obs, reward, terminated, truncated, step_info = env.step(action)
+            done = terminated or truncated
 
-        if done:
-            obs, _ = env.reset()
-        else:
-            obs = next_obs
-    pbar_collect.close()
-    print(f"Replay buffer populated with {len(buffer)} transitions.")
+            buffer.add(obs, action, reward, next_obs, done, context=context_emb)
+            collected_steps += 1
+            pbar_collect.update(1)
 
-    # Phase 1 Step 2: 2,000 gradient updates on random mini-batches
-    print(f"\n[Phase 1: Training World Model for {args.warmup_train_steps} gradient updates]")
-    pbar_train = tqdm(total=args.warmup_train_steps, desc="Warm-up Training")
+            if done:
+                obs, info = env.reset()
+                context_emb = lang_encoder(info["instruction"]) if (lang_encoder and "instruction" in info) else None
+            else:
+                obs = next_obs
+        pbar_collect.close()
+        print(f"Replay buffer populated with {len(buffer)} transitions.")
 
-    for step in range(1, args.warmup_train_steps + 1):
-        batch = buffer.sample(args.batch_size, device=args.device)
-        metrics = agent.train_step(batch)
-        pbar_train.update(1)
+        # Phase 1 Step 2: Gradient updates on random mini-batches
+        print(f"\n[Phase 1: Training World Model for {args.warmup_train_steps} gradient updates]")
+        pbar_train = tqdm(total=args.warmup_train_steps, desc="Warm-up Training")
 
-        if step % args.log_interval == 0 or step == args.warmup_train_steps:
-            # Verify Section 5 Developer Checklist
-            std_mean = metrics["std_mean"]
-            off_diag = metrics["off_diag_mean"]
-            epi_unc = metrics["batch_epi_unc"]
-            viab_acc = metrics["viab_acc"]
+        for step in range(1, args.warmup_train_steps + 1):
+            batch = buffer.sample(args.batch_size, device=args.device)
+            metrics = agent.train_step(batch)
+            pbar_train.update(1)
 
-            health_status = "HEALTHY" if (std_mean >= 0.8 and off_diag <= 0.1) else "ADJUST_NEEDED"
-            pbar_train.set_postfix(
-                loss_dyn=f"{metrics['loss_dyn']:.4f}",
-                loss_reg=f"{metrics['loss_reg']:.4f}",
-                std=f"{std_mean:.3f}",
-                off_diag=f"{off_diag:.3f}",
-                epi=f"{epi_unc:.3f}",
-                status=health_status,
-            )
+            if step % args.log_interval == 0 or step == args.warmup_train_steps:
+                std_mean = metrics["std_mean"]
+                off_diag = metrics["off_diag_mean"]
+                epi_unc = metrics["batch_epi_unc"]
+                viab_acc = metrics["viab_acc"]
 
-            if step % (args.log_interval * 5) == 0:
-                print(
-                    f"\nStep {step}/{args.warmup_train_steps} | "
-                    f"Dyn Loss: {metrics['loss_dyn']:.4f} | "
-                    f"SIGReg Loss: {metrics['loss_reg']:.4f} | "
-                    f"Latent Std: {std_mean:.3f} (target: ~1.0) | "
-                    f"Off-Diag Cov: {off_diag:.4f} (target: <0.1) | "
-                    f"Epistemic Unc: {epi_unc:.4f} | "
-                    f"Viab Acc: {viab_acc:.3f}"
+                health_status = "HEALTHY" if (std_mean >= 0.8 and off_diag <= 0.1) else "ADJUST_NEEDED"
+                pbar_train.set_postfix(
+                    loss_dyn=f"{metrics['loss_dyn']:.4f}",
+                    loss_reg=f"{metrics['loss_reg']:.4f}",
+                    std=f"{std_mean:.3f}",
+                    off_diag=f"{off_diag:.3f}",
+                    epi=f"{epi_unc:.3f}",
+                    status=health_status,
                 )
 
-    pbar_train.close()
-    print("\nWarm-up phase completed. SIGReg convergence verified.")
+                if step % (args.log_interval * 5) == 0:
+                    print(
+                        f"\nStep {step}/{args.warmup_train_steps} | "
+                        f"Dyn Loss: {metrics['loss_dyn']:.4f} | "
+                        f"SIGReg Loss: {metrics['loss_reg']:.4f} | "
+                        f"Latent Std: {std_mean:.3f} (target: ~1.0) | "
+                        f"Off-Diag Cov: {off_diag:.4f} (target: <0.1) | "
+                        f"Epistemic Unc: {epi_unc:.4f} | "
+                        f"Viab Acc: {viab_acc:.3f}"
+                    )
+
+        pbar_train.close()
+        print("\nWarm-up phase completed. SIGReg convergence verified.")
 
     # -------------------------------------------------------------
     # Phase 2: Active Inference Online Control Loop
@@ -319,7 +362,8 @@ def main():
     total_env_steps = args.warmup_steps
 
     for ep in range(1, args.episodes + 1):
-        obs, _ = env.reset()
+        obs, info = env.reset()
+        context_emb = lang_encoder(info["instruction"]) if (lang_encoder and "instruction" in info) else None
         agent.reset_planner()
 
         ep_reward = 0.0
@@ -331,15 +375,15 @@ def main():
         start_time = time.time()
 
         for t in range(args.max_steps_per_episode):
-            # 1. Action Selection via CEM / MPPI Active Inference
-            action, plan_diag = agent.select_action(obs, warm_start=True)
+            # 1. Action Selection via CEM / MPPI Active Inference (conditioned on language)
+            action, plan_diag = agent.select_action(obs, context=context_emb, warm_start=True)
 
             # 2. Step environment
-            next_obs, reward, terminated, truncated, _ = env.step(action)
+            next_obs, reward, terminated, truncated, step_info = env.step(action)
             done = terminated or truncated
 
-            # 3. Store raw tuple into FIFO replay buffer (including reward)
-            buffer.add(obs, action, reward, next_obs, done)
+            # 3. Store raw tuple into FIFO replay buffer (including reward and context)
+            buffer.add(obs, action, reward, next_obs, done, context=context_emb)
 
             # 4. Continuous Online Learning: Sample mini-batch and update world model
             batch = buffer.sample(args.batch_size, device=args.device)

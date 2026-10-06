@@ -45,7 +45,7 @@ class ActiveInferencePlanner:
         self.reward_net = reward_net
         self.horizon = horizon
         self.num_candidates = num_candidates
-        self.num_elites = num_elites
+        self.num_elites = min(num_elites, num_candidates)
         self.num_iterations = num_iterations
         self.w_rew = w_rew
         self.w_epi = w_epi
@@ -72,6 +72,7 @@ class ActiveInferencePlanner:
     def plan(
         self,
         z_t: torch.Tensor,
+        context: Optional[torch.Tensor] = None,
         warm_start: bool = True,
     ) -> Tuple[np.ndarray, Dict[str, float]]:
         """
@@ -79,6 +80,7 @@ class ActiveInferencePlanner:
 
         Args:
             z_t: Current active latent representation (1, D) or (D,)
+            context: Optional language context embedding (1, context_dim) or (context_dim,)
             warm_start: Whether to shift previous solution for initial distribution
 
         Returns:
@@ -88,6 +90,11 @@ class ActiveInferencePlanner:
         if z_t.ndim == 1:
             z_t = z_t.unsqueeze(0)  # (1, D)
         z_t = z_t.to(self.device)
+
+        if context is not None:
+            if context.ndim == 1:
+                context = context.unsqueeze(0)
+            context = context.to(self.device)
 
         # 1. Initialize distribution parameters: mu, sigma: (H, act_dim)
         if warm_start and self.prev_mean is not None:
@@ -114,7 +121,7 @@ class ActiveInferencePlanner:
             candidates = torch.clamp(candidates, self.action_low, self.action_high)
 
             # Evaluate candidate trajectories in latent space
-            costs, cost_breakdown = self._evaluate_candidates(z_t, candidates)
+            costs, cost_breakdown = self._evaluate_candidates(z_t, candidates, context=context)
 
             # Update distribution
             if self.planner_type == "cem":
@@ -166,7 +173,10 @@ class ActiveInferencePlanner:
         return chosen_action, diagnostics
 
     def _evaluate_candidates(
-        self, z_init: torch.Tensor, candidates: torch.Tensor
+        self,
+        z_init: torch.Tensor,
+        candidates: torch.Tensor,
+        context: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
         """
         Roll out candidate trajectories in latent space and compute EFE cost.
@@ -174,6 +184,7 @@ class ActiveInferencePlanner:
         Args:
             z_init: (1, D)
             candidates: (N, H, act_dim)
+            context: optional (1, context_dim)
 
         Returns:
             costs: (N,) scalar cost for each candidate sequence
@@ -192,18 +203,18 @@ class ActiveInferencePlanner:
 
             # 1. Extrinsic reward prediction (Pragmatic Value)
             if self.w_rew > 0 and self.reward_net is not None:
-                r_step = self.reward_net(z_curr, a_step)
+                r_step = self.reward_net(z_curr, a_step, context=context)
                 cum_reward += r_step
 
             # 2. Viability cost of current predicted state
             v_cost = self.viability_net.compute_viability_cost(
-                z_curr, mode=self.viab_cost_mode
+                z_curr, context=context, mode=self.viab_cost_mode
             )
             cum_viab_cost += v_cost
 
             # 3. Ensemble forward step and epistemic uncertainty
             z_next_mean, uncertainty, _ = (
-                self.predictor_ensemble.predict_with_uncertainty(z_curr, a_step)
+                self.predictor_ensemble.predict_with_uncertainty(z_curr, a_step, context=context)
             )
             cum_epi_cost += uncertainty
 
