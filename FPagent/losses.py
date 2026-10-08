@@ -13,6 +13,49 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+class _SymlogFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x: torch.Tensor) -> torch.Tensor:
+        ctx.save_for_backward(x)
+        return torch.sign(x) * torch.log(torch.abs(x) + 1.0)
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor) -> torch.Tensor:
+        (x,) = ctx.saved_tensors
+        # The true mathematical derivative of symlog(x) is 1 / (|x| + 1) everywhere,
+        # including x = 0 (where naive sign(x) autograd would incorrectly evaluate to 0).
+        return grad_output / (torch.abs(x) + 1.0)
+
+
+def symlog(x: torch.Tensor) -> torch.Tensor:
+    """
+    Symmetric logarithm transformation: symlog(x) = sign(x) * ln(|x| + 1).
+    Compresses large values while remaining approximately linear near 0.
+    Uses custom autograd to preserve the true derivative d/dx = 1 / (|x| + 1) at x = 0.
+    """
+    return _SymlogFunction.apply(x)
+
+
+def symexp(x: torch.Tensor) -> torch.Tensor:
+    """
+    Inverse of symlog: symexp(x) = sign(x) * (exp(|x|) - 1).
+    """
+    return torch.sign(x) * (torch.exp(torch.abs(x)) - 1.0)
+
+
+def symlog_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """
+    Squared L2 error in symlog space:
+    loss = 0.5 * (symlog(pred) - symlog(target))^2 (or MSE between symlog-transformed values).
+    Smoothly penalizes outliers like +/-100 without gradient explosion,
+    while maintaining linear sensitivity to small values near zero.
+    """
+    pred_trans = symlog(pred)
+    target_trans = symlog(target)
+    return F.mse_loss(pred_trans, target_trans)
+
+
+
 class SIGReg(nn.Module):
     """
     Sketch Isotropic Gaussian Regularizer (SIGReg) as formulated in LeWorldModel / LeJEPA.

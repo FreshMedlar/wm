@@ -1,10 +1,13 @@
 """
 Training Lifecycle for First-Principles Active Inference Agent.
 
-Implements:
+Implements Pure Offline World Model Training (Option 1):
 - Phase 0: Initialization (Gymnasium pixel env, FIFO buffer, networks)
-- Phase 1: Dynamics Warm-up (Random exploration + 2,000 gradient updates + SIGReg convergence check)
-- Phase 2: Active Inference Online Control Loop (CEM/MPPI planning + continuous online learning)
+- Phase 1: High-Speed Data Collection (Random exploration at >500 FPS, no planning)
+- Phase 2: High-Throughput Offline Training (Pure GPU batched SGD on buffer, zero planning overhead)
+- Phase 3: Active Inference Policy Evaluation (CEM/MPPI trajectory optimization only at test time)
+
+Legacy online interleaved control loop is also available via the --online flag.
 """
 
 import argparse
@@ -17,21 +20,15 @@ from typing import Optional
 # Ensure project root is in sys.path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-# IMPORTANT: miniworld / pyglet must be imported before PyTorch / CUDA
-# to prevent AMD/Nvidia GPU driver shared library conflicts with X11 GLX.
-try:
-    import miniworld
-except ImportError:
-    pass
-
 import gymnasium as gym
 import numpy as np
 import torch
 from tqdm import tqdm
 
-from firstPAgent.agent import FirstPrinciplesActiveInferenceAgent
-from firstPAgent.buffer import PixelReplayBuffer
-from firstPAgent.env import make_pixel_env
+from FPagent.agent import FirstPrinciplesActiveInferenceAgent
+from FPagent.buffer import PixelReplayBuffer
+from FPagent.env import make_pixel_env
+from FPagent.evaluate import evaluate
 
 
 def parse_args():
@@ -70,42 +67,84 @@ def parse_args():
         help="Number of predictor heads in ensemble M (default: 5)",
     )
 
-    # Lifecycle Steps
+    # Offline Training Lifecycle (Option 1)
     parser.add_argument(
+        "--collect_steps",
         "--warmup_steps",
+        dest="collect_steps",
+        type=int,
+        default=10000,
+        help="Phase 1: Environment random exploration steps to collect (default: 10000)",
+    )
+    parser.add_argument(
+        "--train_steps",
+        "--warmup_train_steps",
+        dest="train_steps",
         type=int,
         default=5000,
-        help="Phase 1: Environment random exploration steps (default: 5000)",
+        help="Phase 2: Offline gradient updates on the collected replay buffer (default: 5000)",
     )
     parser.add_argument(
-        "--warmup_train_steps",
+        "--eval_episodes",
         type=int,
-        default=2000,
-        help="Phase 1: Gradient updates after exploration (default: 2000)",
+        default=3,
+        help="Phase 3: Number of evaluation episodes with CEM/MPPI planner (default: 3)",
     )
     parser.add_argument(
-        "--episodes",
+        "--eval_interval",
         type=int,
-        default=50,
-        help="Phase 2: Active inference online control episodes (default: 50)",
+        default=0,
+        help="Interval of train steps to run mid-training evaluation (0 = eval only at end)",
     )
     parser.add_argument(
-        "--max_steps_per_episode",
+        "--save_interval",
         type=int,
-        default=500,
-        help="Max steps per episode",
+        default=1000,
+        help="Gradient updates between checkpoint saves (default: 1000)",
     )
     parser.add_argument(
         "--batch_size",
         type=int,
         default=64,
-        help="Mini-batch size B >= 64 for SIGReg stability",
+        help="Mini-batch size B >= 64 for SIGReg stability (default: 64)",
     )
     parser.add_argument(
         "--buffer_capacity",
         type=int,
         default=100000,
         help="Replay buffer capacity (default: 100000)",
+    )
+    parser.add_argument(
+        "--negative_sample_ratio",
+        type=float,
+        default=0.2,
+        help="Fraction of mini-batch transitions prioritized from salient negative/terminal events (default: 0.2)",
+    )
+    parser.add_argument(
+        "--negative_threshold",
+        type=float,
+        default=-10.0,
+        help="Reward threshold to consider a transition a salient penalty (default: -10.0)",
+    )
+
+    # Optional Legacy Online Control Loop
+    parser.add_argument(
+        "--online",
+        action="store_true",
+        default=False,
+        help="Run legacy per-step online active inference control loop instead of pure offline training",
+    )
+    parser.add_argument(
+        "--episodes",
+        type=int,
+        default=50,
+        help="Episodes for online control loop if --online is enabled (default: 50)",
+    )
+    parser.add_argument(
+        "--max_steps_per_episode",
+        type=int,
+        default=500,
+        help="Max steps per episode during planning rollouts",
     )
 
     # Optimization & Weights
@@ -121,7 +160,7 @@ def parse_args():
         "--gamma", type=float, default=1.0, help="Total loss regularizer weight"
     )
 
-    # Planner
+    # Planner (Used during Evaluation or when --online is active)
     parser.add_argument(
         "--horizon", type=int, default=12, help="Planning horizon H (default: 12)"
     )
@@ -199,7 +238,9 @@ def parse_args():
 def main():
     args = parse_args()
     print("=" * 70)
-    print("First-Principles Active Inference Agent (Single Shared Encoder with Target Detach)")
+    print("First-Principles Active Inference Agent")
+    mode_str = "Legacy Online Loop" if args.online else "Pure Offline Training (High Throughput)"
+    print(f"Mode: {mode_str}")
     print(f"Device: {args.device} | Env: {args.env_id} | Resolution: {args.img_size}x{args.img_size}")
     print(f"Latent Dim: {args.latent_dim} | Ensemble Size: {args.ensemble_size}")
     print("=" * 70)
@@ -212,28 +253,12 @@ def main():
     # Phase 0: Initialization
     # -------------------------------------------------------------
     print("\n[Phase 0: Initialization]")
-    use_language = "miniworld" in args.env_id.lower()
-
-    if use_language:
-        from firstPAgent.miniworld_env import MiniWorldLanguageWrapper
-        from firstPAgent.language import LanguageContextEncoder
-        env = MiniWorldLanguageWrapper(
-            env_id=args.env_id,
-            img_size=(args.img_size, args.img_size),
-            max_episode_steps=args.max_steps_per_episode,
-        )
-        context_dim = 64
-        lang_encoder = LanguageContextEncoder(context_dim=context_dim, device=args.device)
-        print(f"Language conditioning enabled using pretrained MiniLM (context_dim={context_dim})")
-    else:
-        env = make_pixel_env(
-            env_id=args.env_id,
-            continuous=args.continuous,
-            img_size=(args.img_size, args.img_size),
-            seed=args.seed,
-        )
-        context_dim = 0
-        lang_encoder = None
+    env = make_pixel_env(
+        env_id=args.env_id,
+        continuous=args.continuous,
+        img_size=(args.img_size, args.img_size),
+        seed=args.seed,
+    )
 
     obs_shape = env.observation_space.shape  # (C, H, W)
     act_dim = env.action_space.shape[0]
@@ -247,7 +272,6 @@ def main():
         capacity=args.buffer_capacity,
         obs_shape=obs_shape,
         act_dim=act_dim,
-        context_dim=context_dim,
         device=args.device,
     )
 
@@ -256,7 +280,6 @@ def main():
         in_channels=obs_shape[0],
         latent_dim=args.latent_dim,
         act_dim=act_dim,
-        context_dim=context_dim,
         num_models=args.ensemble_size,
         sigreg_knots=args.sigreg_knots,
         sigreg_num_proj=args.sigreg_num_proj,
@@ -284,48 +307,60 @@ def main():
         agent.load(args.resume_checkpoint)
 
     # -------------------------------------------------------------
-    # Phase 1: Dynamics Warm-up (Random Exploration)
+    # Option 1: Pure Offline Training Workflow (Default)
     # -------------------------------------------------------------
-    # If resuming from an already trained world model and warmup_steps==0, skip warm-up
-    skip_warmup = (args.resume_checkpoint is not None and args.warmup_steps == 0)
-    if skip_warmup:
-        print("\n[Phase 1: Skipped because --resume_checkpoint is provided with --warmup_steps 0]")
-    else:
-        print(f"\n[Phase 1: Dynamics Warm-up - Collecting {args.warmup_steps} random steps]")
-    if not skip_warmup:
-        obs, info = env.reset(seed=args.seed)
-        context_emb = lang_encoder(info["instruction"]) if (lang_encoder and "instruction" in info) else None
+    if not args.online:
+        # Phase 1: High-Speed Data Collection (Zero Planning)
+        skip_collection = (args.resume_checkpoint is not None and args.collect_steps == 0)
+        if skip_collection:
+            print("\n[Phase 1: Skipped because --resume_checkpoint is provided with --collect_steps 0]")
+        else:
+            print(f"\n[Phase 1: High-Speed Data Collection - Collecting {args.collect_steps} transitions]")
+            obs, _ = env.reset(seed=args.seed)
+            pbar_collect = tqdm(total=args.collect_steps, desc="Collecting (Fast Random)")
+            collect_start = time.time()
 
-        pbar_collect = tqdm(total=args.warmup_steps, desc="Exploring (Random Policy)")
+            collected_steps = 0
+            episodes_collected = 0
+            while collected_steps < args.collect_steps:
+                action = env.action_space.sample()
+                next_obs, reward, terminated, truncated, _ = env.step(action)
+                done = terminated or truncated
 
-        collected_steps = 0
-        while collected_steps < args.warmup_steps:
-            action = env.action_space.sample()
-            next_obs, reward, terminated, truncated, step_info = env.step(action)
-            done = terminated or truncated
+                buffer.add(obs, action, reward, next_obs, done)
+                collected_steps += 1
+                pbar_collect.update(1)
 
-            buffer.add(obs, action, reward, next_obs, done, context=context_emb)
-            collected_steps += 1
-            pbar_collect.update(1)
+                if done:
+                    episodes_collected += 1
+                    obs, _ = env.reset()
+                else:
+                    obs = next_obs
 
-            if done:
-                obs, info = env.reset()
-                context_emb = lang_encoder(info["instruction"]) if (lang_encoder and "instruction" in info) else None
-            else:
-                obs = next_obs
-        pbar_collect.close()
-        print(f"Replay buffer populated with {len(buffer)} transitions.")
+            pbar_collect.close()
+            collect_dur = max(time.time() - collect_start, 1e-4)
+            collect_fps = collected_steps / collect_dur
+            print(
+                f"Data collection completed: {len(buffer)} transitions ({episodes_collected} episodes) "
+                f"in {collect_dur:.2f}s ({collect_fps:.1f} FPS)."
+            )
 
-        # Phase 1 Step 2: Gradient updates on random mini-batches
-        print(f"\n[Phase 1: Training World Model for {args.warmup_train_steps} gradient updates]")
-        pbar_train = tqdm(total=args.warmup_train_steps, desc="Warm-up Training")
+        # Phase 2: High-Throughput Offline World Model Training
+        print(f"\n[Phase 2: High-Throughput Offline Training - {args.train_steps} gradient updates]")
+        pbar_train = tqdm(total=args.train_steps, desc="Offline Training")
+        train_start = time.time()
 
-        for step in range(1, args.warmup_train_steps + 1):
-            batch = buffer.sample(args.batch_size, device=args.device)
+        for step in range(1, args.train_steps + 1):
+            batch = buffer.sample(
+                args.batch_size,
+                device=args.device,
+                negative_ratio=args.negative_sample_ratio,
+                neg_threshold=args.negative_threshold,
+            )
             metrics = agent.train_step(batch)
             pbar_train.update(1)
 
-            if step % args.log_interval == 0 or step == args.warmup_train_steps:
+            if step % args.log_interval == 0 or step == args.train_steps:
                 std_mean = metrics["std_mean"]
                 off_diag = metrics["off_diag_mean"]
                 epi_unc = metrics["batch_epi_unc"]
@@ -342,95 +377,110 @@ def main():
                 )
 
                 if step % (args.log_interval * 5) == 0:
+                    elapsed = max(time.time() - train_start, 1e-4)
+                    ups = step / elapsed
                     print(
-                        f"\nStep {step}/{args.warmup_train_steps} | "
+                        f"\nStep {step:05d}/{args.train_steps:05d} | "
                         f"Dyn Loss: {metrics['loss_dyn']:.4f} | "
                         f"SIGReg Loss: {metrics['loss_reg']:.4f} | "
-                        f"Latent Std: {std_mean:.3f} (target: ~1.0) | "
-                        f"Off-Diag Cov: {off_diag:.4f} (target: <0.1) | "
+                        f"Latent Std: {std_mean:.3f} | "
+                        f"Off-Diag Cov: {off_diag:.4f} | "
                         f"Epistemic Unc: {epi_unc:.4f} | "
-                        f"Viab Acc: {viab_acc:.3f}"
+                        f"Viab Acc: {viab_acc:.3f} | "
+                        f"Speed: {ups:.1f} updates/s"
                     )
 
+            if step % args.save_interval == 0 or step == args.train_steps:
+                ckpt_path = os.path.join(args.save_dir, f"agent_step{step}.pt")
+                agent.save(ckpt_path)
+                agent.save(os.path.join(args.save_dir, "agent_latest.pt"))
+
+            if args.eval_interval > 0 and step % args.eval_interval == 0 and step < args.train_steps:
+                print(f"\n--> Running mid-training evaluation at step {step}...")
+                evaluate(
+                    agent,
+                    env,
+                    num_episodes=args.eval_episodes,
+                    max_steps=args.max_steps_per_episode,
+                )
+
         pbar_train.close()
-        print("\nWarm-up phase completed. SIGReg convergence verified.")
-
-    # -------------------------------------------------------------
-    # Phase 2: Active Inference Online Control Loop
-    # -------------------------------------------------------------
-    print(f"\n[Phase 2: Active Inference Online Control Loop - {args.episodes} episodes]")
-    total_env_steps = args.warmup_steps
-
-    for ep in range(1, args.episodes + 1):
-        obs, info = env.reset()
-        context_emb = lang_encoder(info["instruction"]) if (lang_encoder and "instruction" in info) else None
-        agent.reset_planner()
-
-        ep_reward = 0.0
-        ep_steps = 0
-        ep_dyn_loss = []
-        ep_reg_loss = []
-        ep_epi_value = []
-        ep_viab_cost = []
-        start_time = time.time()
-
-        for t in range(args.max_steps_per_episode):
-            # 1. Action Selection via CEM / MPPI Active Inference (conditioned on language)
-            action, plan_diag = agent.select_action(obs, context=context_emb, warm_start=True)
-
-            # 2. Step environment
-            next_obs, reward, terminated, truncated, step_info = env.step(action)
-            done = terminated or truncated
-
-            # 3. Store raw tuple into FIFO replay buffer (including reward and context)
-            buffer.add(obs, action, reward, next_obs, done, context=context_emb)
-
-            # 4. Continuous Online Learning: Sample mini-batch and update world model
-            batch = buffer.sample(args.batch_size, device=args.device)
-            train_metrics = agent.train_step(batch)
-
-            # Accumulate metrics
-            ep_reward += reward
-            ep_steps += 1
-            total_env_steps += 1
-            ep_dyn_loss.append(train_metrics["loss_dyn"])
-            ep_reg_loss.append(train_metrics["loss_reg"])
-            ep_epi_value.append(plan_diag.get("mean_epi_value", 0.0))
-            ep_viab_cost.append(plan_diag.get("mean_viab_cost", 0.0))
-
-            if done:
-                break
-            obs = next_obs
-
-        duration = time.time() - start_time
-        fps = ep_steps / max(duration, 1e-4)
-
-        avg_dyn = np.mean(ep_dyn_loss) if ep_dyn_loss else 0.0
-        avg_reg = np.mean(ep_reg_loss) if ep_reg_loss else 0.0
-        avg_epi = np.mean(ep_epi_value) if ep_epi_value else 0.0
-        avg_viab = np.mean(ep_viab_cost) if ep_viab_cost else 0.0
-
-        rew_str = f" | RewLoss: {train_metrics.get('loss_rew', 0.0):.4f}" if args.w_rew > 0 else ""
+        train_dur = max(time.time() - train_start, 1e-4)
         print(
-            f"Episode {ep:03d}/{args.episodes:03d} | "
-            f"Steps: {ep_steps:3d} | "
-            f"Reward: {ep_reward:7.2f} | "
-            f"DynLoss: {avg_dyn:.4f} | "
-            f"SIGReg: {avg_reg:.4f} | "
-            f"EpiVal: {avg_epi:.4f} | "
-            f"ViabCost: {avg_viab:.4f}"
-            f"{rew_str} | "
-            f"Speed: {fps:.1f} FPS"
+            f"\nOffline training finished: {args.train_steps} updates in {train_dur:.2f}s "
+            f"({args.train_steps / train_dur:.1f} updates/s)."
         )
 
-        # Checkpoint every 10 episodes
-        if ep % 10 == 0 or ep == args.episodes:
-            ckpt_path = os.path.join(args.save_dir, f"agent_ep{ep}.pt")
-            agent.save(ckpt_path)
-            print(f"--> Saved checkpoint to {ckpt_path}")
+        # Phase 3: Active Inference Benchmark Evaluation
+        if args.eval_episodes > 0:
+            print(f"\n[Phase 3: Active Inference Benchmark Evaluation - {args.eval_episodes} episodes]")
+            eval_results = evaluate(
+                agent,
+                env,
+                num_episodes=args.eval_episodes,
+                max_steps=args.max_steps_per_episode,
+            )
+            print("\n" + "=" * 60)
+            print("Evaluation Summary:")
+            for k, v in eval_results.items():
+                print(f"  {k:28s}: {v:.4f}")
+            print("=" * 60)
+
+    # -------------------------------------------------------------
+    # Legacy Option: Online Control Loop
+    # -------------------------------------------------------------
+    else:
+        print(f"\n[Phase 1: Warm-up Collection - {args.collect_steps} steps]")
+        obs, _ = env.reset(seed=args.seed)
+        pbar_collect = tqdm(total=args.collect_steps, desc="Exploring (Random)")
+        for _ in range(args.collect_steps):
+            action = env.action_space.sample()
+            next_obs, reward, terminated, truncated, _ = env.step(action)
+            done = terminated or truncated
+            buffer.add(obs, action, reward, next_obs, done)
+            pbar_collect.update(1)
+            obs = env.reset()[0] if done else next_obs
+        pbar_collect.close()
+
+        print(f"\n[Phase 2: Active Inference Online Control Loop - {args.episodes} episodes]")
+        for ep in range(1, args.episodes + 1):
+            obs, _ = env.reset()
+            agent.reset_planner()
+            ep_reward = 0.0
+            ep_steps = 0
+            start_time = time.time()
+
+            for t in range(args.max_steps_per_episode):
+                action, plan_diag = agent.select_action(obs, warm_start=True)
+                next_obs, reward, terminated, truncated, _ = env.step(action)
+                done = terminated or truncated
+
+                buffer.add(obs, action, reward, next_obs, done)
+                batch = buffer.sample(args.batch_size, device=args.device)
+                train_metrics = agent.train_step(batch)
+
+                ep_reward += reward
+                ep_steps += 1
+                if done:
+                    break
+                obs = next_obs
+
+            duration = time.time() - start_time
+            fps = ep_steps / max(duration, 1e-4)
+            print(
+                f"Episode {ep:03d}/{args.episodes:03d} | "
+                f"Steps: {ep_steps:3d} | "
+                f"Reward: {ep_reward:7.2f} | "
+                f"DynLoss: {train_metrics['loss_dyn']:.4f} | "
+                f"SIGReg: {train_metrics['loss_reg']:.4f} | "
+                f"Speed: {fps:.1f} FPS"
+            )
+            if ep % 10 == 0 or ep == args.episodes:
+                ckpt_path = os.path.join(args.save_dir, f"agent_ep{ep}.pt")
+                agent.save(ckpt_path)
 
     env.close()
-    print("\nTraining completed successfully!")
+    print("\nLifecycle completed successfully!")
 
 
 if __name__ == "__main__":

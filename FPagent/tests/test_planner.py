@@ -5,8 +5,8 @@ Unit tests for Active Inference Controller and MPC Planner.
 import unittest
 import numpy as np
 import torch
-from firstPAgent.networks import PredictorEnsemble, ViabilityClassifier
-from firstPAgent.planner import ActiveInferencePlanner
+from FPagent.networks import PredictorEnsemble, ViabilityClassifier
+from FPagent.planner import ActiveInferencePlanner
 
 
 class TestPlanner(unittest.TestCase):
@@ -68,7 +68,7 @@ class TestPlanner(unittest.TestCase):
 
     def test_planner_with_rewards(self):
         """Verify CEM trajectory optimization prioritizing predicted rewards."""
-        from firstPAgent.networks import RewardPredictor
+        from FPagent.networks import RewardPredictor
 
         latent_dim = 16
         act_dim = 2

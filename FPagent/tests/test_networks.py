@@ -8,7 +8,7 @@ Unit tests for neural network architectures:
 
 import unittest
 import torch
-from firstPAgent.networks import (
+from FPagent.networks import (
     PixelEncoder,
     PredictorEnsemble,
     TransitionPredictor,
@@ -71,7 +71,7 @@ class TestNetworks(unittest.TestCase):
 
     def test_reward_predictor(self):
         """RewardPredictor should map (z, a) -> scalar reward."""
-        from firstPAgent.networks import RewardPredictor
+        from FPagent.networks import RewardPredictor
 
         rew_pred = RewardPredictor(latent_dim=32, act_dim=2, hidden_dim=64)
         z = torch.randn(8, 32)

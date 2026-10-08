@@ -5,7 +5,7 @@ Unit tests for SIGReg loss and latent health metrics.
 import unittest
 import torch
 import torch.nn.functional as F
-from firstPAgent.losses import compute_latent_metrics, sigreg_loss
+from FPagent.losses import compute_latent_metrics, sigreg_loss
 
 
 class TestLosses(unittest.TestCase):
@@ -49,6 +49,33 @@ class TestLosses(unittest.TestCase):
         self.assertTrue(0.8 <= metrics["std_mean"] <= 1.2)
         self.assertLess(metrics["off_diag_mean"], 0.1)
 
+    def test_symlog_properties(self):
+        """Verify symlog is symmetric, preserves zero, and inverts properly with symexp."""
+        from FPagent.losses import symexp, symlog, symlog_loss
+
+        x = torch.tensor([-100.0, -10.0, -1.0, 0.0, 1.0, 10.0, 100.0])
+        y = symlog(x)
+        # Symmetrical property: symlog(-x) == -symlog(x)
+        self.assertTrue(torch.allclose(symlog(-x), -y))
+        # Zero preservation: symlog(0) == 0
+        self.assertEqual(symlog(torch.tensor(0.0)).item(), 0.0)
+        # Inversion
+        self.assertTrue(torch.allclose(symexp(y), x, atol=1e-5))
+
+    def test_symlog_loss_gradient(self):
+        """Verify symlog_loss provides finite, non-zero gradients even for extreme outlier rewards."""
+        from FPagent.losses import symlog_loss
+
+        pred = torch.tensor([0.0, 0.0], requires_grad=True)
+        target = torch.tensor([100.0, -100.0])
+        loss = symlog_loss(pred, target)
+        loss.backward()
+        self.assertIsNotNone(pred.grad)
+        # Gradient should be well-behaved and finite
+        self.assertTrue(torch.all(torch.isfinite(pred.grad)))
+        self.assertTrue(torch.all(pred.grad != 0.0))
+
 
 if __name__ == "__main__":
     unittest.main()
+

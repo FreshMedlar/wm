@@ -2,18 +2,18 @@
 First-Principles Active Inference Agent with Single Shared Encoder and Target Detach.
 """
 
-from firstPAgent.agent import FirstPrinciplesActiveInferenceAgent
-from firstPAgent.buffer import PixelReplayBuffer
-from firstPAgent.env import GymPixelWrapper, make_pixel_env
-from firstPAgent.losses import SIGReg, compute_latent_metrics, sigreg_loss
-from firstPAgent.networks import (
+from FPagent.agent import FirstPrinciplesActiveInferenceAgent
+from FPagent.buffer import PixelReplayBuffer
+from FPagent.env import GymPixelWrapper, make_pixel_env
+from FPagent.losses import SIGReg, compute_latent_metrics, sigreg_loss
+from FPagent.networks import (
     PixelEncoder,
     PredictorEnsemble,
     RewardPredictor,
     TransitionPredictor,
     ViabilityClassifier,
 )
-from firstPAgent.planner import ActiveInferencePlanner
+from FPagent.planner import ActiveInferencePlanner
 
 __all__ = [
     "FirstPrinciplesActiveInferenceAgent",

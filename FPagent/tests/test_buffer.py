@@ -5,7 +5,7 @@ Unit tests for Raw FIFO Replay Buffer.
 import unittest
 import numpy as np
 import torch
-from firstPAgent.buffer import PixelReplayBuffer
+from FPagent.buffer import PixelReplayBuffer
 
 
 class TestBuffer(unittest.TestCase):
@@ -51,6 +51,30 @@ class TestBuffer(unittest.TestCase):
 
         _, _, rewards, _, _ = buffer.sample(1)
         self.assertEqual(rewards.item(), 0.0)
+
+    def test_buffer_negative_stratified_sampling(self):
+        """Verify negative_ratio correctly oversamples terminal/negative events."""
+        buffer = PixelReplayBuffer(capacity=100, obs_shape=(3, 16, 16), act_dim=1)
+        # Add 95 mundane steps (rew = 0.0, done = False)
+        for _ in range(95):
+            obs = np.zeros((3, 16, 16), dtype=np.float32)
+            act = np.zeros(1, dtype=np.float32)
+            buffer.add(obs, act, 0.0, obs, False)
+
+        # Add 5 crash steps (rew = -100.0, done = True)
+        for _ in range(5):
+            obs = np.zeros((3, 16, 16), dtype=np.float32)
+            act = np.zeros(1, dtype=np.float32)
+            buffer.add(obs, act, -100.0, obs, True)
+
+        # Uniform sampling: ~5% expected crashes
+        # Stratified sampling with negative_ratio=0.5: at least 50% guaranteed crashes
+        batch_size = 20
+        _, _, rewards, _, dones = buffer.sample(
+            batch_size, negative_ratio=0.5, neg_threshold=-10.0
+        )
+        crashes = (rewards <= -10.0) | (dones == 1.0)
+        self.assertGreaterEqual(crashes.sum().item(), 10)
 
 
 if __name__ == "__main__":

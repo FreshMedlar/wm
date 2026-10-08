@@ -7,9 +7,9 @@ import tempfile
 import unittest
 import numpy as np
 import torch
-from firstPAgent.agent import FirstPrinciplesActiveInferenceAgent
-from firstPAgent.buffer import PixelReplayBuffer
-from firstPAgent.env import make_pixel_env
+from FPagent.agent import FirstPrinciplesActiveInferenceAgent
+from FPagent.buffer import PixelReplayBuffer
+from FPagent.env import make_pixel_env
 
 
 class TestAgentAndIntegration(unittest.TestCase):

@@ -8,7 +8,7 @@ dynamics loss, ensuring the encoder does not minimize dynamics loss by collapsin
 import unittest
 import torch
 import torch.nn.functional as F
-from firstPAgent.networks import PixelEncoder, TransitionPredictor
+from FPagent.networks import PixelEncoder, TransitionPredictor
 
 
 class TestDetachValidation(unittest.TestCase):
